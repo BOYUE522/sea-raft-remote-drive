@@ -1,27 +1,81 @@
-[New!] Please also check [WAFT](https://github.com/princeton-vl/WAFT), our new efficient state-of-the-art method.
+# sea-raft-remote-drive
 
-# SEA-RAFT
+## 项目用途
+- 通过 Tailscale + WebRTC 把车端双摄像头视频低延迟传到电脑端，同时把车速/方向等元数据同步过来，实现远程观察与控制。
+- 当网络丢帧时，电脑端用 SEA-RAFT 做光流补帧，尽量保持画面连续，减少卡顿。
+- 电脑端可接 Logitech G920 方向盘，通过 ROSBridge 远程控制车。
 
-[[Paper](https://arxiv.org/abs/2405.14793)][[Slides](https://docs.google.com/presentation/d/1xZn-NowHuPqfdLDAaQwKyzYvP4HzGmT7/edit?usp=sharing&ouid=118125745783453356964&rtpof=true&sd=true)]
+## 核心原理
+- 车端用 WebRTC 发送两路原始相机视频，并通过 DataChannel 发送每帧的时间戳、车速、方向等信息。
+- 电脑端接收视频与元数据，按时间戳检测缺帧；若发现缺帧，则用相邻两帧计算光流并预测中间帧进行补齐。
+- 画面显示端按实时帧率渲染，若有预测帧就插入到显示流中；一旦新的真实帧到来，立即切回真实帧。
 
-We introduce SEA-RAFT, a more simple, efficient, and accurate [RAFT](https://github.com/princeton-vl/RAFT) for optical flow. Compared with RAFT, SEA-RAFT is trained with a new loss (mixture of Laplace). It directly regresses an initial flow for faster convergence in iterative refinements and introduces rigid-motion pre-training to improve generalization. SEA-RAFT achieves state-of-the-art accuracy on the [Spring benchmark](https://spring-benchmark.org/) with a 3.69 endpoint-error (EPE) and a 0.36 1-pixel outlier rate (1px), representing 22.9\% and 17.8\% error reduction from best-published results. In addition, SEA-RAFT obtains the best cross-dataset generalization on KITTI and Spring. With its high efficiency, SEA-RAFT operates at least 2.3x faster than existing methods while maintaining competitive performance.
+## 总说明书（电脑端 + 车端完整流程）
+先在电脑端接好 G920 方向盘与显示器，并给电脑端接上非校园网（例如手机热点）。
 
-<img src="assets/visualization.png" width='1000'>
+步骤 1（电脑端，启动接收与补帧）：
+```bash
+conda run -n sea-raft python webrtc_tailscale_realtime/receiver_realtime.py \
+  --listen 0.0.0.0 --port 8080 \
+  --cfg config/eval/kitti-M.json \
+  --path weight/Tartan-C-T-TSKH-kitti432x960-M.pth \
+  --fps 30 --device cuda
+```
+
+步骤 2（车端，启动 ROS/DBW 相关）：
+```bash
+~/ros2_ws/src/boyue$ ./start_g920_alienware.sh
+```
+
+步骤 3（车端，打开另一个 terminal，启动双摄像头发送）：
+```bash
+~/ros2_ws/src/boyue/webrtc_tailscale_realtime$ python3 car_dual_sender.py \
+  --signal http://100.78.251.61:8080/offer \
+  --send_fps 30 --send_width 960 --send_height 540 --codec vp8
+```
+
+步骤 4（电脑端，打开另一个 terminal，启动方向盘控制）：
+```bash
+python /home/boyue/SEA/SEA-RAFT-main/webrtc_tailscale_realtime/g920_tailscale_control.py
+```
+
+## 原理详解（学术版）
+### 1) 系统架构与同步机制
+- 车端通过 WebRTC 发送两路视频流，使用 DataChannel 同步每帧元数据（时间戳 ts_ms、车速 v、方向 steer 等）。
+- 电脑端用 Tailscale 作为安全覆盖网络，保证跨网段、NAT 场景下仍可建立 P2P 或中继链路。
+- 接收端将视频帧与元数据按时间顺序对齐，形成时序样本序列。
+
+### 2) 缺帧检测模型
+- 设目标帧率为 fps，期望间隔 Δt = 1000/fps ms。
+- 若相邻两帧时间戳间隔 ΔT > κ·Δt（κ 为阈值），判定存在缺帧，缺帧数量约为 m = round(ΔT/Δt) - 1。
+- 对于低帧率输入，按 fps_target / fps_input 估计补帧数量。
+
+### 3) 光流估计与插值/外推
+- 使用 SEA-RAFT 估计密集光流 F（像素级位移场），捕捉局部运动。
+- 在“局部恒速”假设下，中间时刻位移可视为线性缩放：F_α = α · F，其中 α = Δ/Δt。
+- 通过反向/双线性重采样进行图像变换（warping）：Î(t) = W(I_ref, F_α)，其中 W(·) 为采样算子，I_ref 为参考帧。
+- 若引入速度信息，可做速度比例修正：F_α = (v_target / v_ref) · α · F，用于近似加速/减速的运动幅度变化。
+
+### 4) 多相机并行与可视化
+- 双相机各自独立维护窗口与光流序列，分别补帧。
+- 电脑端将两路结果融合到本地 GUI（与车端一致），显示仪表与视野。
+
+## 致谢与参考
+以下内容来自 SEA-RAFT 项目与论文（原作者信息保留）：
+
+[New!] Please also check WAFT, our new efficient state-of-the-art method.
+SEA-RAFT
+
+[Paper][Slides]
+
+We introduce SEA-RAFT, a more simple, efficient, and accurate RAFT for optical flow. Compared with RAFT, SEA-RAFT is trained with a new loss (mixture of Laplace). It directly regresses an initial flow for faster convergence in iterative refinements and introduces rigid-motion pre-training to improve generalization. SEA-RAFT achieves state-of-the-art accuracy on the Spring benchmark with a 3.69 endpoint-error (EPE) and a 0.36 1-pixel outlier rate (1px), representing 22.9% and 17.8% error reduction from best-published results. In addition, SEA-RAFT obtains the best cross-dataset generalization on KITTI and Spring. With its high efficiency, SEA-RAFT operates at least 2.3x faster than existing methods while maintaining competitive performance.
 
 If you find SEA-RAFT useful for your work, please consider citing our academic paper:
+SEA-RAFT: Simple, Efficient, Accurate RAFT for Optical Flow
 
-<h3 align="center">
-    <a href="https://arxiv.org/abs/2405.14793">
-        SEA-RAFT: Simple, Efficient, Accurate RAFT for Optical Flow
-    </a>
-</h3>
-<p align="center">
-    <a href="https://memoryslices.github.io/">Yihan Wang</a>,
-    <a href="https://www.lahavlipson.com/">Lahav Lipson</a>,
-    <a href="http://www.cs.princeton.edu/~jiadeng">Jia Deng</a><br>
-</p>
+Yihan Wang, Lahav Lipson, Jia Deng
 
-```
+```bibtex
 @article{wang2024sea,
   title={SEA-RAFT: Simple, Efficient, Accurate RAFT for Optical Flow},
   author={Wang, Yihan and Lipson, Lahav and Deng, Jia},
@@ -30,37 +84,43 @@ If you find SEA-RAFT useful for your work, please consider citing our academic p
 }
 ```
 
-## Requirements
+Requirements
+
 Our code is developed with pytorch 2.2.0, CUDA 12.2 and python 3.10.
-```Shell
+
+```
 conda create --name SEA-RAFT python=3.10.13
 conda activate SEA-RAFT
 pip install -r requirements.txt
 ```
 
-## Model Zoo
+Model Zoo
 
-Google Drive: [link](https://drive.google.com/drive/folders/1YLovlvUW94vciWvTyLf-p3uWscbOQRWW?usp=sharing).
+Google Drive: link.
 
-HuggingFace: [link](https://huggingface.co/papers/2405.14793).
+HuggingFace: link.
 
-## Custom Usage
+Custom Usage
 
-We provide an example in `custom.py`. By default, this file will take two RGB images as the input and provide visualizations of the optical flow and the uncertainty. You can load your model by providing the path:
-```Shell
+We provide an example in custom.py. By default, this file will take two RGB images as the input and provide visualizations of the optical flow and the uncertainty. You can load your model by providing the path:
+
+```
 python custom.py --cfg config/eval/spring-M.json --path models/Tartan-C-T-TSKH-spring540x960-M.pth
 ```
-or load our models through HuggingFace🤗 (make sure you have installed huggingface-hub):
-```Shell
+
+or load our models through HuggingFace (make sure you have installed huggingface-hub):
+
+```
 python custom.py --cfg config/eval/spring-M.json --url MemorySlices/Tartan-C-T-TSKH-spring540x960-M
 ```
 
-## Datasets
-To evaluate/train SEA-RAFT, you will need to download the required datasets: [FlyingChairs](https://lmb.informatik.uni-freiburg.de/resources/datasets/FlyingChairs.en.html#flyingchairs), [FlyingThings3D](https://lmb.informatik.uni-freiburg.de/resources/datasets/SceneFlowDatasets.en.html), [Sintel](http://sintel.is.tue.mpg.de/), [KITTI](http://www.cvlibs.net/datasets/kitti/eval_scene_flow.php?benchmark=flow), [HD1K](http://hci-benchmark.iwr.uni-heidelberg.de/), [TartanAir](https://theairlab.org/tartanair-dataset/), and [Spring](https://spring-benchmark.org/).
+Datasets
 
-By default `datasets.py` will search for the datasets in these locations. You can create symbolic links to wherever the datasets were downloaded in the `datasets` folder. Please check [RAFT](https://github.com/princeton-vl/RAFT) for more details.
+To evaluate/train SEA-RAFT, you will need to download the required datasets: FlyingChairs, FlyingThings3D, Sintel, KITTI, HD1K, TartanAir, and Spring.
 
-```Shell
+By default datasets.py will search for the datasets in these locations. You can create symbolic links to wherever the datasets were downloaded in the datasets folder. Please check RAFT for more details.
+
+```
 ├── datasets
     ├── Sintel
     ├── KITTI
@@ -74,102 +134,5 @@ By default `datasets.py` will search for the datasets in these locations. You ca
     ├── tartanair
 ```
 
-## Training, Evaluation, and Submission
-
-Please refer to [scripts/train.sh](scripts/train.sh), [scripts/eval.sh](scripts/eval.sh), and [scripts/submission.sh](scripts/submission.sh) for more details.
-
-## 实时低延迟传输与插帧（Tailscale + WebRTC）
-
-下面是本项目在“车端 → 电脑端”实时传输 GUI 画面并进行丢帧补帧的完整使用说明。
-
-### 功能概述
-- 车端采集相机并渲染 GUI（HUD/Logo/镜像），本地显示同时通过 WebRTC 发送到电脑端。
-- 通过 DataChannel 发送每帧元数据：`ts_ms`、`speed`、`steer`、`fps`、`width`、`height`。
-- 电脑端检测丢帧（基于 `ts_ms` 间隔）并用 SEA-RAFT 预测插帧，预测帧会显示 `PRED` 标记。
-- 支持“仅显示不插帧”的调试模式。
-
-### 相关脚本
-- 车端发送：`webrtc_tailscale_realtime/car_gui_sender.py`
-- 电脑端仅显示（调试）：`webrtc_tailscale_realtime/receiver_viewer.py`
-- 电脑端插帧：`webrtc_tailscale_realtime/receiver_realtime.py`
-
-### 环境准备（电脑端）
-推荐在 `sea-raft` 环境中运行，并固定以下版本以避免不兼容问题：
-- `numpy=1.26.4`
-- `scipy=1.11.4`
-- `opencv=4.8.1`（conda-forge）
-
-```Shell
-conda activate sea-raft
-conda install -y "numpy=1.26.4" "scipy=1.11.4"
-conda install -y -c conda-forge "opencv=4.8.1"
-pip install aiortc aiohttp av
-```
-
-### 车端操作（发送端）
-1) 确认 Tailscale 已连通（能 ping 通电脑端 IP）。
-2) 运行发送脚本：
-
-```Shell
-python3 webrtc_tailscale_realtime/car_gui_sender.py \
-  --signal http://<PC_TAILSCALE_IP>:8080/offer \
-  --send_fps 30 \
-  --send_width 960 --send_height 540 \
-  --codec vp8
-```
-
-常用参数：
-- `--send_fps`：发送帧率
-- `--send_width/--send_height`：发送分辨率（降低可减少带宽和延迟）
-- `--codec`：`vp8`（兼容好）或 `h264`
-- `--no_display`：车端不显示窗口（仅发送）
-
-说明：
-- 车端本地会显示 GUI（默认）。
-- 速度/方向盘角度来自 ROS2 话题（示例在脚本内），不可用时会用 0。
-
-### 电脑端操作（仅显示/调试）
-1) 启动调试接收器（不做插帧）：
-
-```Shell
-conda run -n sea-raft python webrtc_tailscale_realtime/receiver_viewer.py \
-  --listen 0.0.0.0 --port 8080
-```
-
-预期输出：
-- 终端看到 `[viewer] track: video`
-- 终端每秒打印 `[viewer] video fps ~ ...`
-- 窗口出现实时画面
-
-### 电脑端操作（插帧）
-1) 启动插帧接收器：
-
-```Shell
-conda run -n sea-raft python webrtc_tailscale_realtime/receiver_realtime.py \
-  --listen 0.0.0.0 --port 8080 \
-  --cfg config/eval/kitti-M.json \
-  --path weight/Tartan-C-T-TSKH-kitti432x960-M.pth \
-  --fps 30 --device cuda
-```
-
-插帧规则：
-- 用 `ts_ms` 的间隔判断是否丢帧（默认阈值为 1.5 倍帧间隔）。
-- 每 5 帧构建一次预测序列，基于前 2 帧推后 8 帧。
-- 预测流会根据速度比例进行缩放（速度越大，光流越长）。
-- 预测帧显示 `PRED` 标记。
-
-常用参数：
-- `--fps`：期望帧率（影响丢帧判断）
-- `--gap_threshold`：丢帧阈值系数（默认 1.5）
-- `--window_size`：构建预测序列的窗口大小（默认 5）
-- `--horizon`：每次预测的帧数（默认 8）
-- `--raw_only`：只显示，不插帧
-
-### 常见问题
-- 窗口不显示：请确认不是在纯 SSH 无图形环境；需要本地桌面环境或 X11 转发。
-- 画面空白：先用 `receiver_viewer.py` 验证链路；若无视频帧，检查车端摄像头是否打开。
-- 性能不足：降低 `--send_width/--send_height` 或发送帧率。
-
-## Acknowledgements
-
-This project relies on code from existing repositories: [RAFT](https://github.com/princeton-vl/RAFT), [unimatch](https://github.com/autonomousvision/unimatch/tree/master), [Flowformer](https://github.com/drinkingcoder/FlowFormer-Official), [ptlflow](https://github.com/hmorimitsu/ptlflow), and [LoFTR](https://github.com/zju3dv/LoFTR). We thank the original authors for their excellent work.
+Training, Evaluation, and Submission
+Please refer to scripts/train.sh, scripts/eval.sh, and scripts/submission.sh for more details.
